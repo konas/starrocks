@@ -161,6 +161,27 @@ public class OptExternalPartitionPruner {
         return equalPredicates;
     }
 
+    private static Map<ColumnRefOperator, List<String>> getColumnINConstantValues(ScalarOperator predicate) {
+        List<ScalarOperator> predicateList = Utils.extractConjuncts(predicate);
+        Map<ColumnRefOperator, List<String>> result = Maps.newHashMap();
+        for (ScalarOperator op : predicateList) {
+            if (op instanceof InPredicateOperator) {
+                InPredicateOperator inOp = (InPredicateOperator) op;
+                if (!inOp.isNotIn() && inOp.getChild(0).isColumnRef()
+                        && inOp.allValuesMatch(ScalarOperator::isConstantRef)) {
+                    ColumnRefOperator colRef = (ColumnRefOperator) inOp.getChild(0);
+                    List<String> values = new ArrayList<>();
+                    for (int i = 1; i < inOp.getChildren().size(); i++) {
+                        ConstantOperator constant = inOp.getChild(i).cast();
+                        values.add(constant.getVarchar());
+                    }
+                    result.put(colRef, values);
+                }
+            }
+        }
+        return result;
+    }
+
     /**
      * If the following conditions are met, false is returned:
      * 1. Predicates does not contain partition columns
@@ -240,6 +261,27 @@ public class OptExternalPartitionPruner {
         return false;
     }
 
+    private static List<Optional<List<String>>> getEffectiveInPartitionValues(
+            LogicalScanOperator operator, List<Column> partitionColumns, ScalarOperator predicate) {
+        Map<ColumnRefOperator, List<String>> inValues = getColumnINConstantValues(predicate);
+        if (inValues.isEmpty()) {
+            return null;
+        }
+
+        List<Optional<List<String>>> result = new ArrayList<>();
+        boolean hasAny = false;
+        for (Column col : partitionColumns) {
+            ColumnRefOperator colRef = operator.getColumnReference(col);
+            if (col.getType().isStringType() && inValues.containsKey(colRef)) {
+                result.add(Optional.of(inValues.get(colRef)));
+                hasAny = true;
+            } else {
+                result.add(Optional.empty());
+            }
+        }
+        return hasAny ? result : null;
+    }
+
     // get equivalence predicate which column ref is partition column
     public static List<Optional<ScalarOperator>> getEffectivePartitionPredicate(LogicalScanOperator operator,
             List<Column> partitionColumns, ScalarOperator predicate) {
@@ -263,6 +305,54 @@ public class OptExternalPartitionPruner {
             }
         }
         return effectivePartitionPredicate;
+    }
+
+    private static final int MAX_IN_COMBINATIONS = 64;
+
+    private static List<String> listPartitionNamesForInValues(
+            HiveMetaStoreTable hmsTable,
+            List<Optional<List<String>>> inPartitionValues) {
+        // Calculate total combinations
+        long combinations = 1;
+        for (Optional<List<String>> vals : inPartitionValues) {
+            if (vals.isPresent()) {
+                combinations *= vals.get().size();
+            }
+        }
+        if (combinations > MAX_IN_COMBINATIONS) {
+            return null; // too many combinations, fall back to full fetch
+        }
+
+        // Generate all value combinations via cartesian product
+        List<List<Optional<String>>> allCombinations = new ArrayList<>();
+        allCombinations.add(new ArrayList<>());
+        for (Optional<List<String>> vals : inPartitionValues) {
+            List<List<Optional<String>>> newCombinations = new ArrayList<>();
+            for (List<Optional<String>> existing : allCombinations) {
+                if (vals.isPresent()) {
+                    for (String v : vals.get()) {
+                        List<Optional<String>> copy = new ArrayList<>(existing);
+                        copy.add(Optional.of(v));
+                        newCombinations.add(copy);
+                    }
+                } else {
+                    List<Optional<String>> copy = new ArrayList<>(existing);
+                    copy.add(Optional.empty());
+                    newCombinations.add(copy);
+                }
+            }
+            allCombinations = newCombinations;
+        }
+
+        // Call listPartitionNamesByValue for each combination, union results
+        Set<String> partitionNameSet = Sets.newHashSet();
+        for (List<Optional<String>> combo : allCombinations) {
+            List<String> names = GlobalStateMgr.getCurrentState().getMetadataMgr()
+                    .listPartitionNamesByValue(hmsTable.getCatalogName(),
+                            hmsTable.getDbName(), hmsTable.getTableName(), combo);
+            partitionNameSet.addAll(names);
+        }
+        return new ArrayList<>(partitionNameSet);
     }
 
     private static List<Optional<String>> getPartitionValue(List<Optional<ScalarOperator>> predicates) {
@@ -324,9 +414,19 @@ public class OptExternalPartitionPruner {
                             .listPartitionNamesByValue(hmsTable.getCatalogName(), hmsTable.getDbName(),
                                     hmsTable.getTableName(), partitionValues);
                 } else {
-                    partitionNames = GlobalStateMgr.getCurrentState().getMetadataMgr()
-                            .listPartitionNames(hmsTable.getCatalogName(), hmsTable.getDbName(),
-                                    hmsTable.getTableName());
+                    // try IN predicate path before falling back to full partition fetch
+                    List<Optional<List<String>>> inPartitionValues =
+                            getEffectiveInPartitionValues(operator, partitionColumns, operator.getPredicate());
+                    if (inPartitionValues != null) {
+                        partitionNames = listPartitionNamesForInValues(hmsTable, inPartitionValues);
+                    } else {
+                        partitionNames = null;
+                    }
+                    if (partitionNames == null) {
+                        partitionNames = GlobalStateMgr.getCurrentState().getMetadataMgr()
+                                .listPartitionNames(hmsTable.getCatalogName(), hmsTable.getDbName(),
+                                        hmsTable.getTableName());
+                    }
                 }
 
                 List<PartitionKey> keys = new ArrayList<>();
